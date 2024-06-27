@@ -1,0 +1,117 @@
+variables:
+  APP_NAME: mlops
+  PYTHON_VERSION: "3.10.12"
+  MLFLOW_VERSION: "2.10.2"
+  POETRY_HOME: "/opt/poetry"
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  ENV_FILE: ".env"
+  FLYTE_PROJECT: "mlops"
+  FLYTE_DOMAIN: "development"
+  FLYTE_TASK_DIR: "./mlops/workflows"
+  FLYTE_ADMIN_ENDPOINT: "dns:///{fqdn}"
+  FLYTE_ADMIN_AUTHTYPE: "Pkce"
+  FLYTE_ADMIN_INSECURESKIPVERIFY: "True"
+  FLYTE_LOGGER_SHOW_SOURCE: "true"
+  FLYTE_LOGGER_LEVEL: "0"
+
+
+image: docker:20.10.10
+
+services:
+  - name: docker:20.10.10-dind
+    alias: docker
+    # THIS IS IMPORTANT!
+    command: ["--tls=false"]
+
+stages:
+  - setup
+  - test
+  - build
+#  - register
+
+# SETUP STAGE
+setup-python:
+  # In this script, we download poetry, add it to $PATH,
+  # validate the repo, and check that the lock is correct.
+  # We then determine build number and write it to a .env file.
+  # This script is only run on master branch - and not for tags.
+  stage: "setup"
+  image: "python:${PYTHON_VERSION}"
+  only:
+    - dev
+  before_script:
+    - curl -sSL https://install.python-poetry.org | python3 -
+    - export PATH=${POETRY_HOME}/bin:${PATH}
+    - poetry check
+    - poetry lock
+    - MLOPS_VERSION="$(poetry version -s)"
+    - MLOPS_BUILD="${MLOPS_VERSION}-$(git rev-parse --short HEAD)"
+    - echo "export MLOPS_VERSION=${MLOPS_VERSION}" >> $ENV_FILE
+    - echo "export MLOPS_BUILD=${MLOPS_BUILD}" >> $ENV_FILE
+  script:
+    - poetry self --version
+    - poetry add --group ci anybadge
+    - poetry run anybadge -l build_number -v ${MLOPS_BUILD} -f build_number.svg -c black
+  artifacts:
+    paths:
+      - $ENV_FILE
+      - build_number.svg
+    expire_in: 1 week
+
+# TEST STAGE
+flyte-test-register:
+  # In this script we attempt to register flyte tasks.
+  # We first install flytectl, update the config, and install
+  # our main deps.
+  # We then do a pyflyte dry run registration.
+  # This script is run for all branches.
+  extends: "setup-python"
+  stage: "test"
+  script: |
+    source $ENV_FILE
+    curl -sL https://ctl.flyte.org/install | bash
+    ./bin/flytectl config init
+    cat > ~/.flyte/config.yaml << EOF
+    admin:
+      endpoint: ${FLYTE_ADMIN_ENDPOINT}
+      authType: ${FLYTE_ADMIN_AUTHTYPE}
+      insecureSkipVerify: ${FLYTE_ADMIN_INSECURESKIPVERIFY}
+    logger:
+      show-source: ${FLYTE_LOGGER_SHOW_SOURCE}
+      level: ${FLYTE_LOGGER_LEVEL}
+    EOF
+    poetry install
+    poetry run pyflyte register "${FLYTE_TASK_DIR}" \
+      --project "${FLYTE_PROJECT}" \
+      --domain "${FLYTE_DOMAIN}" \
+      --version "${FLINT_BUILD}" \
+      --service-account flytepropeller \
+      --dry-run
+
+
+build-dev:
+  image: docker:20.10.10
+  stage: build
+  environment: $CI_COMMIT_BRANCH
+  only:
+    - dev
+  variables:
+    # ECR_AWS_ACCOUNT: $ECR_AWS_ACCOUNT
+    # ECR_AWS_REGION: $ECR_AWS_REGION
+    DOCKER_IMAGE_REGISTRY: $ECR_AWS_ACCOUNT.dkr.ecr.$ECR_AWS_REGION.amazonaws.com
+#    IMAGE_TAG: $DOCKER_IMAGE_REGISTRY/dev-$APP_NAME:$CI_PIPELINE_IID
+
+  script: |
+    source $ENV_FILE
+    apk add --no-cache aws-cli
+    aws ecr get-login-password --region $ECR_AWS_REGION | docker login --username AWS --password-stdin $DOCKER_IMAGE_REGISTRY
+    docker --version
+    IMAGE_TAG=$DOCKER_IMAGE_REGISTRY/dev-$APP_NAME:$MLFLOW_VERSION-$MLOPS_VERSION
+    echo ${IMAGE_TAG}
+    docker build -t ${IMAGE_TAG} . --no-cache --build-arg PYTHON_VERSION=$PYTHON_VERSION
+    docker images
+    docker push $IMAGE_TAG
+  after_script:
+    - docker logout $DOCKER_IMAGE_REGISTRY
